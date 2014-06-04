@@ -1,0 +1,340 @@
+import numpy as np
+import scipy as sp
+import pandas as pd
+import scipy.signal as sig
+import scipy.fftpack as fft
+from brian import hears
+from brian import Hz, kHz
+from mne import filter as flt
+from ecog import utils as utl
+
+__all__ = ['car',
+           'extract_pspec',
+           'extract_amp',
+           'extract_amp_range',
+           'extract_amp_hilbert',
+           'next_pow_2',
+           'make_power_of_two',
+           'downsample_df',
+           'resample_df',
+           'sigmoid',
+           'roll_and_subtract',
+           'xcorr']
+
+
+# Referencing
+def car(signal, grouping=None, use_elecs=None):
+    '''Computes the common average reference of a signal.
+    INPUTS
+    --------
+        signal : array_like, timepoints x features
+            the signal to be re-referenced,
+        grouping : vector, n_features longe
+            a group identity vector that is n_features long
+
+    OUTPUTS
+    --------
+    signal_car : array_like
+        the signal after having the common averaged removed
+    '''
+    if grouping is None:
+        grouping = np.ones(signal.shape[1])
+    if use_elecs is None:
+        use_elecs = np.ones(signal.shape[1])
+    df = signal.copy()
+
+    # Drop zeros from grouping
+    grouping = grouping[grouping != 0]
+
+    assert grouping.shape[0] == signal.shape[1], ['Grouping vec must be same'
+                                                  'length as n_features']
+
+    print('Number of groups found: {0}'.format(len(np.unique(grouping))))
+    for group in np.unique(grouping):
+        mask = np.logical_and(grouping == group, use_elecs)
+        grpsignal = df.loc[:, mask]
+        commonsignal = grpsignal.mean(axis=1)
+        df.loc[:, mask] = np.subtract(grpsignal, commonsignal[:, None])
+
+    signal = pd.DataFrame(signal, index=df.index, columns=df.columns)
+    return signal
+
+
+# Spectral Methods
+def extract_pspec(signal, elecs=slice(None)):
+    '''Returns the power spectrum of your data
+    INPUTS
+    -------
+    signal : array_like (tpts x features)
+        The signal to extract the power spectrum
+    elecs : vector of ints
+        The features (usually electrodes) to use
+        in the analysis
+
+    RETURNS
+    -------
+    amp : np.array
+        the power spectrum of the signal
+    '''
+    myfft = fft.rfft(signal[:, elecs], axis=1)
+    return np.abs(myfft)**2
+
+
+def extract_amp(signal, Fs, Flo, Fhi, pad_to_2=True, n_jobs=3):
+    '''Extracts the analytic amplitude of the signal
+    for a given bandpass using the hilbert transform.
+
+    NOTE: if the signal is not of length that is a power of 2,
+    it will take MUCH longer.  Use pad_to_nearest_power_of_two to ensure this.
+
+    INPUTS:
+        signal              :   The signal to be processed (tpts x features)
+        Fs              :   The sampling rate of the signal
+        lims                :   The bandpass limits to use for filtering before
+                                the hilbert transform
+        pad_to_2            :   Whether we pad the signal to be of lenght 2**X
+                                before filtering.
+                                This can drastically speed up the time it takes
+
+    OUTPUTS:
+        np.array            :   The analytic amplitude for the
+                                bandpass specified.
+
+
+    NOTES:
+        Could make this faster by doing all filtering in the frequency domain,
+        then calculating hilbert transform here,
+        this way we'd skip an extra ifft / fft
+    '''
+    # Ensuring signal shape
+    m, n = signal.shape
+    if len(signal.shape) == 1:
+        signal = signal[:, None]
+    assert m > n, ["Signal should be tpts x features, "
+                   "you have more features than tps so "
+                   "I assume it's an error"]
+
+    # First bandpass filter the signal
+    signal = flt.band_pass_filter(signal.T, Fs, Flo, Fhi,
+                                  n_jobs=n_jobs)
+    signal = signal.T
+
+    # Run the hilbert transform and take the absolute value for the amplitude
+    # Pad to nearest power of two for big speedup
+    N = 2**np.ceil(np.log2(m)) if pad_to_2 is True else m
+    assert N % 2 == 0, "Your signal length should really be a power of two..."
+    signal = extract_amp_hilbert(signal, N=N, axis=0, n_jobs=n_jobs)
+    return signal
+
+
+def xcorr(a, b=None, n_lags=None, calc_lags=True, kind=None):
+    '''
+    Calculates the cross-correlation between two one-dimensional signals,
+    along with the ability to return time-lags as well. If a second signal
+    is not given, then it will compute the autocorrelation.
+
+    INPUTS
+    --------
+    a : array-like, 1-d
+        The first signal
+    b : array-like, 1-d (optional)
+        The second signal, if None, then b will be set equal to a
+    n_lags : int
+        The number of lags before and after zero to return
+    calc_lags : bool
+        Whether to return a vector of time lags along with the correlation
+        values
+    kind : string, or None. ['abs']
+        If we want to do some special things to the signals before
+        cross-correlating
+    '''
+    b = a if b is None else b
+
+    a, b = (np.squeeze(i) for i in [a, b])
+    assert len(a.shape) == 1 and len(b.shape) == 1, ['a and b must '
+                                                     'be one-dimensional']
+
+    if kind == 'abs':
+        a = np.abs(a)
+        b = np.abs(b)
+
+    # Calculate the correlation
+    cor = sig.correlate(a, b)
+
+    # Halfway point
+    h = np.ceil(cor.shape[0] / 2.).astype(int)
+
+    # Now only keep the lags we want
+    if n_lags is None:
+        n_lags = h - 1
+    else:
+        cor = cor[h-n_lags-1:h+n_lags]
+
+    # Define lags if we want them
+    if calc_lags is True:
+        lags = np.linspace(-n_lags, n_lags, cor.shape[0])
+        return [cor, lags]
+
+    return cor
+
+
+def extract_amp_hilbert(s, N=None, axis=0, n_jobs=3):
+    '''Extracts the analytic amplitude of a
+    signal using the Hilbert trasnform'''
+    m, n = s.shape
+    par, parfunc, _ = utl.parallel_func(sig.hilbert, n_jobs=n_jobs)
+    amp = par(parfunc(s[:, i], N=N, axis=0)
+              for i in range(n))
+    amp = np.abs(amp).T  # The parallelization changes the dimensions
+    return amp[:m, ...]
+
+
+def extract_amp_range(signal, Fs, frange, pad_to_2=True):
+    '''Extracts the analytic amplitude for a range of bandpassed values.
+    Note that this makes more sense if the frequencies you're extracting
+    are a bit higher.  The power drops off as a function of frequency,
+    so there are more differences between neighboring low frequencies
+    than neighboring high ones.
+
+    INPUTS:
+        signal              :   the signal to be processed (tpts x features)
+        Fs              :   the sampling rate of the signal
+        frange              :   a list of frequencies we want to use as bin
+                                centers for the filter
+        pad_to_2            :   whether we want to pad the signal to
+                                length 2**X first
+
+    OUTPUTS:
+        f_amps              :   a list of analytic amplitudes for each
+                                frequency bin in the range specified.
+    '''
+    # Extract 1/12 octave above and below each frequency band
+    octave_stps = (2**np.log2(frange)) / 12
+    hg_fs = [[f-o, f+o] for f, o in zip(frange, octave_stps)]
+
+    # Extract the range of amplitudes and return the list
+    f_amps = []
+    for i, fs in enumerate(hg_fs):
+        if i % 5 == 0:
+            print fs
+        f_amps.append(extract_amp(signal, Fs, lims=fs))
+    return f_amps
+
+
+# Code for inhibitory network
+def roll_and_subtract(sig, n=1, axis=1, hwr=False):
+    '''Rolls the input matrix along the specifies axis, then
+    subtracts this from the original signal. This is meant to
+    be similar to the lateral inhibitory network from Shamma's
+    NSL toolbox. hwr specifies whether to include a half-wave
+    rectification after doing the subtraction.'''
+    diff = np.roll(sig, -n, axis=axis)
+    diff[:, -n:] = 0
+    diff = np.subtract(sig, diff)
+    if hwr is True:
+        diff = np.clip(diff, 0, np.inf)
+    return diff
+
+
+def next_pow_2(signal, axis=0):
+    '''Returns the length of signal that would be needed such that the input
+    signal is now length of a power of two'''
+    nextp2 = np.ceil(np.log2(signal.shape[axis]))
+    return 2**nextp2
+
+
+def make_power_of_two(signal, method='high'):
+    '''This takes a signal, and pads it with zeros until its length is a power
+    of two
+
+    INPUTS:
+        signal          :   time x features
+
+    OUTPUTS:
+        np.array        :   the padded signal
+    '''
+    if len(signal.shape) == 1:
+        signal = signal[:, None]
+
+    if method == 'high':
+        # Define new length
+        old_length = signal.shape[0]
+        next_power = np.ceil(np.log2(old_length))
+        new_length = 2**next_power
+        assert new_length < 2**30, ("Your signal is going to be really big."
+                                    "Consider downsampling...")
+
+        # Create padding and append
+        padding = np.zeros([new_length - old_length, signal.shape[1]])
+        if isinstance(signal, pd.DataFrame):
+            padding = pd.DataFrame(padding)
+            return signal.append(padding)
+        else:
+            return np.squeeze(np.vstack([signal, padding]))
+    elif method == 'low':
+        raise NotImplementedError("This method hasn't been implemented yet")
+        pass
+
+
+def sigmoid(y, fac=.1):
+    '''Passes a signal through a sigmoid function. This effectively compresses
+    the signal depending on the value of fac.
+
+    INPUTS
+    --------
+    y : array_like
+        The input signal
+    fac : float, default = .1
+        The sigmoid factor. Numbers closer to zero means a steeper sigmoid
+        curve. fac==0 is a step function (and will return a boolean).
+        In general, sigmoid of .1 seems good for neural data.
+    '''
+    if fac > 0:
+        y = np.exp(-y / fac)
+        y = 1 / (1+y)
+    elif fac == 0:
+        y = y > 0
+    else:
+        raise Exception('factor must be >= 0')
+    return y
+
+
+def downsample_df(df, down_fac):
+    down = sp.signal.decimate(df.values, down_fac, axis=0)
+    df = pd.DataFrame(down, columns=df.columns, index=df.index[::down_fac])
+    df.columns = df.columns.astype(int).astype('U16')
+    return df
+
+
+def resample_df(df, sr_new, sr_old, toobig=False):
+    '''
+    Resamples a dataframe to a specific length.  This is a more complex process
+    than simply downsampling by an integer factor.  It accomplishes this by
+    first upsampling and then downsampling depending on the desired factor.
+
+    It includes the option to do this column by column, in case the matrix
+    is too large to be upsampled.
+
+    INPUT:
+                df          : the dataframe to be resampled
+                                (samples x features)
+                new_length  : the length of the resampled DataFrame
+                toobig      : whether the dataframe is too big to fit into
+                                memory when upsampled
+    '''
+    n = df.shape[0]
+    np2 = next_pow_2(df)
+    d = np2 - n
+    if toobig is False:
+        # If df isn't too big, then we can resample as normal
+        dfn = flt.resample(df, sr_new, sr_old, npad=d/2, axis=0)
+        dfn = pd.DataFrame(dfn, columns=df.columns)
+        dfn.columns = dfn.columns.astype('U16')
+    else:
+        # We need to resample column by column, to avoid memory issues
+        dfn = pd.DataFrame()
+        cols = df.columns
+        for col in cols:
+            dfn[col] = flt.resample(df, sr_new, sr_old, npad=d/2, axis=0)
+            df.drop(col, axis=1)
+    return dfn
